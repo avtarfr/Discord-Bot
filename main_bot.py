@@ -54,6 +54,29 @@ def load_team_roles():
             return data.get("roles", [])
     return []
 
+def get_populated_channels(guild):
+    active_cids = []
+    team_roles_data = load_team_roles()
+    team_role_ids = [r["id"] for r in team_roles_data]
+    raw_channels = load_target_channels()
+    
+    for cid in raw_channels:
+        channel = guild.get_channel(cid)
+        if not channel: 
+            continue
+            
+        targets_to_check = list(channel.overwrites.keys())
+        if channel.category:
+            targets_to_check.extend(list(channel.category.overwrites.keys()))
+            
+        for target in targets_to_check:
+            if isinstance(target, discord.Role) and target.id in team_role_ids:
+                if len(target.members) > 0:
+                    active_cids.append(cid)
+                    break
+                    
+    return active_cids
+
 def get_time_text(q_num):
     limit = TIME_LIMITS.get(q_num)
     if limit:
@@ -71,6 +94,7 @@ drive_service = build('drive', 'v3', credentials=creds)
 
 intents = discord.Intents.default()
 intents.message_content = True
+intents.members = True 
 bot = commands.Bot(command_prefix="!", intents=intents)
 
 class TeamSelect(Select):
@@ -94,6 +118,10 @@ class TeamSelect(Select):
         role = interaction.guild.get_role(role_id)
         
         if role:
+            if len(role.members) >= 1:
+                await interaction.response.send_message("that team is already taken.", ephemeral=True)
+                return
+            
             await interaction.user.add_roles(role)
             await interaction.response.send_message(f"successfully joined {role.name}", ephemeral=True)
         else:
@@ -167,7 +195,7 @@ async def game_timer_loop():
                     mod_chan = bot.get_channel(MOD_CHANNEL_ID)
                     if mod_chan:
                         msg = await mod_chan.send(
-                            f"<@&{MOD_ROLE_ID}> 🚨 **Time Expired** for <#{cid}> on Q{q_num}.\n"
+                            f"<@&{MOD_ROLE_ID}> Time Expired for <#{cid}> on Q{q_num}.\n"
                             f"They have 20 mins to send a prisoner. React ✅ when prisoner arrives to resume."
                         )
                         await msg.add_reaction("✅")
@@ -281,8 +309,12 @@ async def leaderboard(ctx):
     sorted_teams = sorted(game_state.items(), key=lambda item: item[1]["q_num"], reverse=True)
     lines = []
     for rank, (cid, state) in enumerate(sorted_teams, 1):
-        status_tag = f" ({state.get('status', 'active')})" if state.get('status') != "active" else ""
-        lines.append(f"{rank}. <#{cid}> - question {state['q_num']}{status_tag}")
+        if state.get("status") == "disqualified":
+            lines.append(f"{rank}. <#{cid}> - disqualified at Q{state['q_num']}")
+        elif state.get("status") == "waiting_for_prison":
+            lines.append(f"{rank}. <#{cid}> - Q{state['q_num']} (waiting for prison)")
+        else:
+            lines.append(f"{rank}. <#{cid}> - Q{state['q_num']}")
         
     chunk = "**leaderboard:**\n"
     for line in lines:
@@ -295,6 +327,28 @@ async def leaderboard(ctx):
 
 @bot.command()
 @commands.has_permissions(administrator=True)
+async def reset_game(ctx):
+    global BROADCAST_SENT
+    if ctx.channel.id != MOD_CHANNEL_ID:
+        return
+        
+    game_state.clear()
+    save_state(game_state)
+    BROADCAST_SENT = False
+    
+    await ctx.send("game state wiped and broadcast lock lifted.")
+
+@bot.command()
+@commands.has_permissions(administrator=True)
+async def stop_bot(ctx):
+    if ctx.channel.id != MOD_CHANNEL_ID:
+        return
+        
+    await ctx.send("shutting down...")
+    await bot.close()
+
+@bot.command()
+@commands.has_permissions(administrator=True)
 async def broadcast_start(ctx):
     global BROADCAST_SENT
     if ctx.channel.id != MOD_CHANNEL_ID:
@@ -304,9 +358,9 @@ async def broadcast_start(ctx):
         await ctx.send("Broadcast already sent. Restart bot to reset.")
         return
 
-    target_channels = load_target_channels()
+    target_channels = get_populated_channels(ctx.guild)
     if not target_channels:
-        await ctx.send("No channels found.")
+        await ctx.send("no populated channels found.")
         return
 
     for cid in target_channels:
@@ -407,7 +461,6 @@ async def on_reaction_add(reaction, user):
             target_chan = bot.get_channel(target_id)
             
             if target_chan:
-                await target_chan.purge(limit=None)
                 await target_chan.send(f"Verified. Moving to Question {new_q}:\n{time_msg}", file=file)
                 
         elif str(reaction.emoji) == "❌":
